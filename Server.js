@@ -1,137 +1,132 @@
 // server.js
-// 簡單的 Express + WebSocket signaling：支援
-// 1) 固定配對 A1<->A2, B1<->B2, C1<->C2, D1<->D2
-// 2) Viewer 單向觀看任一 Peer（recvonly）
-// 不做 SFU，皆為 P2P，一對一
+// Node.js + Express 靜態檔案 + WebSocket Signaling
+// - 首頁顯示使用說明
+// - 維護 peers 與 viewers 線上清單
+// - 註冊即自動配對（A1<->A2, B1<->B2, C1<->C2, D1<->D2）
+// - 中繼 viewer 與 peer 的 SDP / ICE
 
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
-const path = require("path");
 
 const app = express();
+app.use(express.static("public"));
+
+// 首頁說明（避免 Cannot GET /）
+app.get("/", (req, res) => {
+  res.send(`<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>WebRTC Nine</title></head>
+<body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Arial;">
+  <h2>請選擇角色</h2>
+  <ul>
+    <li><a href="/peer.html?id=A1">Peer A1</a></li>
+    <li><a href="/peer.html?id=A2">Peer A2</a></li>
+    <li><a href="/peer.html?id=B1">Peer B1</a></li>
+    <li><a href="/peer.html?id=B2">Peer B2</a></li>
+    <li><a href="/peer.html?id=C1">Peer C1</a></li>
+    <li><a href="/peer.html?id=C2">Peer C2</a></li>
+    <li><a href="/peer.html?id=D1">Peer D1</a></li>
+    <li><a href="/peer.html?id=D2">Peer D2</a></li>
+    <li><a href="/viewer.html">Viewer（查詢端）</a></li>
+  </ul>
+  <p>Peer 端請務必使用上方帶 <code>?id=</code> 的連結（A1～D2）。</p>
+</body>
+</html>`);
+});
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-app.use(express.static(path.join(__dirname, "public")));
+const peers = {};   // id -> ws （A1..D2）
+const viewers = {}; // id -> ws （viewer-xxxxx）
 
-const idToWS = new Map();     // id -> ws
-const wsToId = new Map();     // ws -> id
-const idToRole = new Map();   // id -> 'peer' | 'viewer'
-
-// 固定配對表
-const PAIRS = {
-  "A1": "A2", "A2": "A1",
-  "B1": "B2", "B2": "B1",
-  "C1": "C2", "C2": "C1",
-  "D1": "D2", "D2": "D1"
-};
+const PAIRS = { A1:"A2", A2:"A1", B1:"B2", B2:"B1", C1:"C2", C2:"C1", D1:"D2", D2:"D1" };
 
 function safeSend(ws, obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
+  try { ws.send(JSON.stringify(obj)); } catch {}
+}
+
+function broadcastPeerList() {
+  const online = Object.keys(peers);
+  Object.values(viewers).forEach(vws => {
+    safeSend(vws, { type: "peerList", peers: online });
+  });
+}
+
+function tryPair(id) {
+  const partner = PAIRS[id];
+  if (!partner) return;
+  if (peers[id] && peers[partner]) {
+    // 同步通知雙方開始配對
+    safeSend(peers[id],      { type: "startPair", partnerId: partner });
+    safeSend(peers[partner], { type: "startPair", partnerId: id });
+    console.log(`配對成功：${id} <--> ${partner}`);
   }
 }
 
-function getPartnerId(id) {
-  return PAIRS[id] || null;
-}
-
 wss.on("connection", (ws) => {
-  console.log("[WS] client connected");
+  ws.meta = { id: null, role: null };
 
-  ws.on("message", (raw) => {
-    let data;
-    try { data = JSON.parse(raw.toString()); }
-    catch { return; }
+  ws.on("message", (data) => {
+    let msg;
+    try { msg = JSON.parse(data); } catch { return; }
 
-    const { type } = data;
+    // 註冊
+    if (msg.type === "register") {
+      const { id, role } = msg;
+      ws.meta.id = id;
+      ws.meta.role = role;
 
-    // 使用者註冊：{ type:'register', id:'A1', role:'peer'|'viewer' }
-    if (type === "register") {
-      const { id, role } = data;
-      if (!id || !role) return;
-
-      // 若同 ID 已在線，先踢掉舊的
-      const old = idToWS.get(id);
-      if (old && old !== ws) {
-        safeSend(old, { type: "forceDisconnect", reason: "duplicate_id_login" });
-        try { old.close(); } catch {}
-      }
-
-      idToWS.set(id, ws);
-      wsToId.set(ws, id);
-      idToRole.set(id, role);
-
-      console.log(`[REGISTER] ${id} as ${role}`);
-
-      // 回覆註冊成功
-      safeSend(ws, { type: "registered", id, role });
-
-      // 如果這是 peer，且對應伙伴在線，請剛加入的這一方發起 offer
       if (role === "peer") {
-        const partnerId = getPartnerId(id);
-        if (partnerId && idToWS.has(partnerId)) {
-          // 通知剛加入的 peer：開始與 partner 進行配對
-          safeSend(ws, { type: "startPair", partnerId });
-          // 同時通知對方：你可能會收到對方的 offer（僅提示用）
-          safeSend(idToWS.get(partnerId), { type: "partnerOnline", partnerId: id });
-        }
+        peers[id] = ws;
+        console.log("Peer registered:", id);
+        safeSend(ws, { type: "registered", id });
+        broadcastPeerList();
+        tryPair(id); // ✅ 註冊當下就嘗試配對
+        return;
       }
-      return;
+      if (role === "viewer") {
+        viewers[id] = ws;
+        console.log("Viewer registered:", id);
+        safeSend(ws, { type: "registered", id });
+        broadcastPeerList(); // 告知目前線上 peers
+        return;
+      }
     }
 
-    // 轉送信令（peer <-> peer / viewer <-> peer）
-    // 通用格式：{ type:'relay', to:'ID', payload:{ ... } }
-    if (type === "relay") {
-      const { to, payload } = data;
-      if (!to || !payload) return;
-      const target = idToWS.get(to);
-      if (!target) {
-        // 對方不在線
+    // 中繼（viewer/peer 互相傳 offer/answer/candidate）
+    if (msg.type === "relay") {
+      const { to, payload } = msg;
+      const fromId = ws.meta.id;
+      payload.from = fromId;
+
+      if (peers[to]) { safeSend(peers[to], { type: "relay", payload }); return; }
+      if (viewers[to]) { safeSend(viewers[to], { type: "relay", payload }); return; }
+
+      // 目標不在線，若是 viewer 的請求，就提示
+      if (ws.meta.role === "viewer") {
         safeSend(ws, { type: "peerOffline", to });
-        return;
       }
-      // 附上 from 以利對端識別
-      payload.from = wsToId.get(ws);
-      safeSend(target, { type: "relay", payload });
-      return;
-    }
-
-    // Viewer 要求觀看誰（可選：也可走上方 relay 通用機制）
-    // { type:'viewerSelect', viewerId:'Viewer01', targetId:'A1' }
-    if (type === "viewerSelect") {
-      const { viewerId, targetId } = data;
-      const viewerWS = idToWS.get(viewerId);
-      const targetWS = idToWS.get(targetId);
-      if (!viewerWS) {
-        safeSend(ws, { type: "error", message: "viewer not registered" });
-        return;
-      }
-      if (!targetWS) {
-        safeSend(viewerWS, { type: "error", message: `target ${targetId} offline` });
-        return;
-      }
-      // 通知 viewer：目標在線
-      safeSend(viewerWS, { type: "viewerTargetReady", targetId });
       return;
     }
   });
 
   ws.on("close", () => {
-    const id = wsToId.get(ws);
-    if (id) {
-      idToWS.delete(id);
-      idToRole.delete(id);
-      wsToId.delete(ws);
-      console.log(`[WS] ${id} disconnected`);
-    } else {
-      console.log("[WS] client disconnected (unregistered)");
+    const { id, role } = ws.meta;
+    if (role === "peer" && peers[id] === ws) {
+      delete peers[id];
+      console.log("Peer disconnected:", id);
+      broadcastPeerList();
+    }
+    if (role === "viewer" && viewers[id] === ws) {
+      delete viewers[id];
+      console.log("Viewer disconnected:", id);
     }
   });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`HTTP+WS server running on http://localhost:${PORT}`);
+  console.log("Server running on port " + PORT);
 });

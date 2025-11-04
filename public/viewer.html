@@ -1,150 +1,118 @@
-<!-- public/viewer.html
-  第9台查詢電腦使用：單向觀看任意一台 Peer 的視訊
-  - 自己不開攝影機
-  - 透過 recvonly offer 要求目標 Peer 回傳視訊
--->
+<!-- public/viewer.html -->
 <!doctype html>
 <html lang="zh-Hant">
 <head>
   <meta charset="utf-8" />
-  <title>Viewer（查詢電腦）</title>
-  <link rel="stylesheet" href="client.css" />
+  <title>Viewer</title>
+  <link rel="stylesheet" href="/client.css" />
 </head>
 <body>
-  <h1>Viewer（查詢電腦）<span class="badge">單向觀看</span></h1>
+  <h2>Viewer</h2>
 
-  <div class="row">
-    <div class="card">
-      <label>Viewer ID</label>
-      <input id="viewerId" placeholder="例如 Viewer01" />
-      <button id="btnRegister" class="primary">註冊</button>
+  <h3>選擇觀看對象</h3>
+  <div id="btnGroup" class="grid"></div>
 
-      <label style="margin-top:8px;">選擇要觀看的 Peer</label>
-      <select id="targetSelect">
-        <option>A1</option><option>A2</option>
-        <option>B1</option><option>B2</option>
-        <option>C1</option><option>C2</option>
-        <option>D1</option><option>D2</option>
-      </select>
-      <button id="btnWatch">開始觀看</button>
+  <video id="remoteVideo" autoplay playsinline></video>
+  <p id="status"></p>
 
-      <div class="status" id="status"></div>
-    </div>
+<script>
+const statusEl = document.getElementById("status");
+const btnGroup = document.getElementById("btnGroup");
+const remoteVideo = document.getElementById("remoteVideo");
 
-    <div class="card">
-      <h3>觀看畫面</h3>
-      <video id="remoteVideo" autoplay playsinline controls></video>
-    </div>
-  </div>
+function log(s){ statusEl.textContent = s; console.log(s); }
 
-  <script>
-    const ws = new WebSocket(`ws://${location.host}`);
-    const statusEl = document.getElementById("status");
-    const viewerIdEl = document.getElementById("viewerId");
-    const btnRegister = document.getElementById("btnRegister");
-    const targetSel = document.getElementById("targetSelect");
-    const btnWatch = document.getElementById("btnWatch");
-    const remoteVideo = document.getElementById("remoteVideo");
+const viewerId = "viewer-" + Math.random().toString(36).slice(2, 8);
+const ws = new WebSocket(`wss://${location.host}`);
 
-    const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
-    let viewerId = null;
-    let targetId = null;
+function wsSend(to, payload) {
+  ws.send(JSON.stringify({ type: "relay", to, payload }));
+}
 
-    let pc = null;
+const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
-    function log(msg) {
-      console.log(msg);
-      statusEl.textContent = msg;
+let pc = null;
+let targetId = null;
+
+ws.onopen = () => {
+  ws.send(JSON.stringify({ type: "register", id: viewerId, role: "viewer" }));
+  log(`已註冊：${viewerId}，等待線上清單…`);
+};
+
+ws.onmessage = async (ev) => {
+  const msg = JSON.parse(ev.data);
+
+  if (msg.type === "registered") return;
+
+  // 伺服器同步在線 peer 清單
+  if (msg.type === "peerList") {
+    const allPeers = ["A1","A2","B1","B2","C1","C2","D1","D2"];
+    btnGroup.innerHTML = "";
+    allPeers.forEach(id => {
+      const online = msg.peers.includes(id);
+      const btn = document.createElement("button");
+      btn.textContent = id;
+      btn.disabled = !online;
+      btn.onclick = () => startWatch(id);
+      btnGroup.appendChild(btn);
+    });
+
+    // 若目前觀看目標離線了，提示並關閉
+    if (targetId && !msg.peers.includes(targetId)) {
+      log(`${targetId} 已離線`);
+      targetId = null;
+      if (pc) { pc.close(); pc = null; }
+      remoteVideo.srcObject = null;
     }
+    return;
+  }
 
-    function wsSend(obj) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  // 對應目標的回覆/候選
+  if (msg.type === "relay" && msg.payload) {
+    const p = msg.payload;
+    if (p.from === targetId) {
+      if (p.kind === "answer" && pc) {
+        await pc.setRemoteDescription(new RTCSessionDescription(p.sdp));
+        log(`已接收 ${targetId} Answer，開始播放`);
+      }
+      if (p.kind === "candidate" && pc && p.candidate) {
+        try { await pc.addIceCandidate(p.candidate); } catch {}
+      }
     }
+    return;
+  }
 
-    function createPC() {
-      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  if (msg.type === "peerOffline") {
+    log(`目標 ${msg.to} 不在線`);
+  }
+};
 
-      // 我方為 recvonly，不加入本地 track
-      pc.onicecandidate = (ev) => {
-        if (ev.candidate && targetId) {
-          wsSend({
-            type: "relay",
-            to: targetId,
-            payload: { kind: "viewerCandidate", candidate: ev.candidate }
-          });
-        }
-      };
-      pc.ontrack = (ev) => {
-        remoteVideo.srcObject = ev.streams[0];
-      };
-      return pc;
+async function startWatch(id) {
+  targetId = id;
+  log(`請求觀看：${id}`);
+
+  if (pc) pc.close();
+  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+  pc.ontrack = (e) => {
+    remoteVideo.srcObject = e.streams[0];
+  };
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      wsSend(targetId, { kind: "candidate", candidate: e.candidate });
     }
+  };
 
-    btnRegister.onclick = () => {
-      viewerId = viewerIdEl.value.trim() || "Viewer01";
-      wsSend({ type: "register", id: viewerId, role: "viewer" });
-    };
+  // 僅接收（不送本機）
+  pc.addTransceiver("video", { direction: "recvonly" });
 
-    btnWatch.onclick = async () => {
-      if (!viewerId) return alert("請先註冊 Viewer ID");
-      targetId = targetSel.value;
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
 
-      // 告訴伺服器我要看誰（可選步驟）
-      wsSend({ type: "viewerSelect", viewerId, targetId });
-
-      // 建立 recvonly
-      if (pc) pc.close();
-      pc = createPC();
-      pc.addTransceiver("video", { direction: "recvonly" });
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      // 將 offer 轉給目標 peer
-      wsSend({
-        type: "relay",
-        to: targetId,
-        payload: { kind: "viewerOffer", sdp: offer }
-      });
-
-      log(`已向 ${targetId} 發出觀看請求`);
-    };
-
-    ws.onmessage = async (ev) => {
-      const msg = JSON.parse(ev.data);
-
-      if (msg.type === "registered") {
-        log(`Viewer 註冊成功：${msg.id}`);
-        return;
-      }
-
-      if (msg.type === "viewerTargetReady") {
-        log(`目標在線：${msg.targetId}，等待回應…`);
-        return;
-      }
-
-      if (msg.type === "error") {
-        log(`錯誤：${msg.message}`);
-        return;
-      }
-
-      if (msg.type === "relay" && msg.payload) {
-        const p = msg.payload;
-        // 來自目標 peer 的回應
-        if (p.kind === "viewerAnswer") {
-          await pc.setRemoteDescription(new RTCSessionDescription(p.sdp));
-          log(`已連上 ${p.from}（單向觀看）`);
-        } else if (p.kind === "viewerCandidate" && p.candidate) {
-          try { await pc.addIceCandidate(p.candidate); } catch {}
-        }
-      }
-
-      if (msg.type === "forceDisconnect") {
-        log("被迫下線：" + (msg.reason || ""));
-        location.reload();
-      }
-    };
-  </script>
+  // 轉給目標 peer
+  wsSend(targetId, { kind: "viewerOffer", sdp: offer });
+}
+</script>
 </body>
 </html>
-
