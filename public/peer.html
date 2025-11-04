@@ -1,200 +1,226 @@
 <!-- public/peer.html -->
 <!doctype html>
 <html lang="zh-Hant">
+
 <head>
   <meta charset="utf-8" />
   <title>Peer</title>
   <link rel="stylesheet" href="/client.css" />
 </head>
+
 <body>
   <h2 id="title">Peer</h2>
   <video id="remoteVideo" autoplay playsinline></video>
   <p id="status"></p>
 
-<script>
-const statusEl = document.getElementById("status");
-const titleEl  = document.getElementById("title");
-const remoteVideo = document.getElementById("remoteVideo");
+  <script>
+    const statusEl = document.getElementById("status");
+    const titleEl = document.getElementById("title");
+    const remoteVideo = document.getElementById("remoteVideo");
 
-// 從 URL 取得裝置 ID（必填）
-const urlParams = new URLSearchParams(location.search);
-const myId = urlParams.get("id");
-if (!myId) {
-  alert("缺少裝置 ID，請使用 /peer.html?id=A1 這類 URL 開啟");
-  throw new Error("Missing id");
-}
-titleEl.textContent = `Peer (${myId})`;
-
-const ws = new WebSocket(`wss://${location.host}`);
-
-function log(s){ statusEl.textContent = s; console.log(s); }
-function wsSend(obj){ if(ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
-
-const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
-
-let localStream = null;
-let partnerId = null;
-let partnerPC = null;  // 與對等裝置的連線
-let viewerPCs = {};    // 與各 Viewer（可能多個）的連線（sendonly）
-
-// 先開啟本機串流（僅用於傳送，不插 local <video>）
-(async () => {
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 1280, height: 720, frameRate: 30 },
-      audio: false
-    });
-  } catch (e) {
-    alert("無法存取攝影機：" + e);
-    return;
-  }
-})();
-
-ws.onopen = () => {
-  wsSend({ type: "register", id: myId, role: "peer" });
-  log(`已註冊：${myId}，等待配對…`);
-};
-
-function lexicographicallySmaller(a, b) {
-  return (a || "") < (b || "");
-}
-
-async function startPartnerAsCaller() {
-  partnerPC?.close();
-  partnerPC = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-
-  partnerPC.onicecandidate = (e) => {
-    if (e.candidate) {
-      wsSend({ type: "relay", to: partnerId, payload: { kind: "candidate", candidate: e.candidate } });
+    // 從 URL 取得裝置 ID（必填）
+    const urlParams = new URLSearchParams(location.search);
+    const myId = urlParams.get("id");
+    if (!myId) {
+      alert("缺少裝置 ID，請使用 /peer.html?id=A1 這類 URL 開啟");
+      throw new Error("Missing id");
     }
-  };
+    titleEl.textContent = `Peer (${myId})`;
 
-  partnerPC.ontrack = (e) => {
-    remoteVideo.srcObject = e.streams[0];
-  };
+    const ws = new WebSocket(`wss://${location.host}`);
 
-  localStream.getTracks().forEach(t => partnerPC.addTrack(t, localStream));
+    function log(s) { statusEl.textContent = s; console.log(s); }
+    function wsSend(obj) { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
 
-  const offer = await partnerPC.createOffer();
-  await partnerPC.setLocalDescription(offer);
+    const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 
-  // ✅ 等待 ICE 全部收集完畢再送 Offer
-  await new Promise(resolve => {
-    if (partnerPC.iceGatheringState === "complete") {
-      resolve();
-    } else {
-      partnerPC.onicegatheringstatechange = () => {
+    let localStream = null;
+    let partnerId = null;
+    let partnerPC = null;  // 與對等裝置的連線
+    let viewerPCs = {};    // 與各 Viewer（可能多個）的連線（sendonly）
+
+    // 先開啟本機串流（僅用於傳送，不插 local <video>）
+    (async () => {
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 1280, height: 720, frameRate: 30 },
+          audio: false
+        });
+
+        log("攝影機初始化完成，若已有配對對象則開始連線");
+
+        // ✅ 如果對方已經在線並配對成功
+        if (partnerId) {
+          if (lexicographicallySmaller(myId, partnerId)) {
+            await startPartnerAsCaller();
+          } else {
+            log(`等待 ${partnerId} 的 Offer…`);
+          }
+        }
+
+      } catch (e) {
+        alert("無法存取攝影機：" + e);
+      }
+    })();
+
+    ws.onopen = () => {
+      wsSend({ type: "register", id: myId, role: "peer" });
+      log(`已註冊：${myId}，等待配對…`);
+    };
+
+    function lexicographicallySmaller(a, b) {
+      return (a || "") < (b || "");
+    }
+
+    async function startPartnerAsCaller() {
+      // ✅ 防呆：攝影機未開好不執行
+      if (!localStream) {
+        log("等待攝影機開啟中…");
+        return;
+      }
+
+      partnerPC?.close();
+      partnerPC = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+      partnerPC.onicecandidate = (e) => {
+        if (e.candidate) {
+          wsSend({ type: "relay", to: partnerId, payload: { kind: "candidate", candidate: e.candidate } });
+        }
+      };
+
+      partnerPC.ontrack = (e) => {
+        remoteVideo.srcObject = e.streams[0];
+      };
+
+      localStream.getTracks().forEach(t => partnerPC.addTrack(t, localStream));
+
+      const offer = await partnerPC.createOffer();
+      await partnerPC.setLocalDescription(offer);
+
+      // ✅ 等待 ICE 全部收集完畢再送 Offer
+      await new Promise(resolve => {
         if (partnerPC.iceGatheringState === "complete") {
           resolve();
+        } else {
+          partnerPC.onicegatheringstatechange = () => {
+            if (partnerPC.iceGatheringState === "complete") {
+              resolve();
+            }
+          };
         }
-      };
+      });
+
+      wsSend({
+        type: "relay",
+        to: partnerId,
+        payload: { kind: "offer", sdp: partnerPC.localDescription }
+      });
+      log(`向 ${partnerId} 發出 Offer（ICE Ready）`);
     }
-  });
 
-  wsSend({
-    type: "relay",
-    to: partnerId,
-    payload: { kind: "offer", sdp: partnerPC.localDescription }
-  });
-  log(`向 ${partnerId} 發出 Offer（ICE Ready）`);
-}
-
-async function startPartnerAsCallee(offer) {
-  partnerPC?.close();
-  partnerPC = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-
-  partnerPC.onicecandidate = (e) => {
-    if (e.candidate) {
-      wsSend({ type: "relay", to: partnerId, payload: { kind: "candidate", candidate: e.candidate } });
-    }
-  };
-
-  partnerPC.ontrack = (e) => {
-    remoteVideo.srcObject = e.streams[0];
-  };
-
-  localStream.getTracks().forEach(t => partnerPC.addTrack(t, localStream));
-
-  await partnerPC.setRemoteDescription(new RTCSessionDescription(offer));
-  const answer = await partnerPC.createAnswer();
-  await partnerPC.setLocalDescription(answer);
-  wsSend({ type: "relay", to: partnerId, payload: { kind: "answer", sdp: answer } });
-  log(`回覆 ${partnerId} Answer`);
-}
-
-ws.onmessage = async (ev) => {
-  const msg = JSON.parse(ev.data);
-
-  if (msg.type === "registered") {
-    log(`已註冊並等待配對…`);
-    return;
-  }
-
-  // 伺服器配對通知
-  if (msg.type === "startPair") {
-    partnerId = msg.partnerId;
-    log(`配對成功：${myId} <--> ${partnerId}`);
-
-    // 決定由誰主動發 Offer（避免雙邊同時發）
-    if (lexicographicallySmaller(myId, partnerId)) {
-      await startPartnerAsCaller();
-    } else {
-      log(`等待 ${partnerId} 的 Offer…`);
-    }
-    return;
-  }
-
-  // 中繼訊息（包含：offer/answer/candidate 與 viewerOffer）
-  if (msg.type === "relay" && msg.payload) {
-    const p = msg.payload;
-
-    // 來自 Partner 的信令
-    if (p.from === partnerId) {
-      if (p.kind === "offer") {
-        await startPartnerAsCallee(p.sdp);
+    async function startPartnerAsCallee(offer) {
+      // ✅ 防呆：攝影機未開好不執行
+      if (!localStream) {
+        log("本機串流尚未就緒，暫時無法回應 Offer");
+        return;
       }
-      if (p.kind === "answer" && partnerPC) {
-        await partnerPC.setRemoteDescription(new RTCSessionDescription(p.sdp));
-        log(`已接收 ${partnerId} Answer`);
-      }
-      if (p.kind === "candidate" && partnerPC && p.candidate) {
-        try { await partnerPC.addIceCandidate(p.candidate); } catch {}
-      }
-      return;
-    }
 
-    // 來自某個 Viewer 的觀看請求（viewerOffer）
-    if (p.kind === "viewerOffer") {
-      const viewerId = p.from;
-      // 與此 viewer 建立 sendonly
-      let vpc = viewerPCs[viewerId];
-      if (vpc) { vpc.close(); }
-      vpc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-      viewerPCs[viewerId] = vpc;
+      partnerPC?.close();
+      partnerPC = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-      vpc.onicecandidate = (e) => {
+      partnerPC.onicecandidate = (e) => {
         if (e.candidate) {
-          wsSend({ type: "relay", to: viewerId, payload: { kind:"candidate", candidate:e.candidate } });
+          wsSend({ type: "relay", to: partnerId, payload: { kind: "candidate", candidate: e.candidate } });
         }
       };
 
-      // 只傳送本機影像
-      localStream.getTracks().forEach(t => vpc.addTrack(t, localStream));
+      partnerPC.ontrack = (e) => {
+        remoteVideo.srcObject = e.streams[0];
+      };
 
-      await vpc.setRemoteDescription(new RTCSessionDescription(p.sdp));
-      const answer = await vpc.createAnswer();
-      await vpc.setLocalDescription(answer);
+      localStream.getTracks().forEach(t => partnerPC.addTrack(t, localStream));
 
-      wsSend({ type: "relay", to: viewerId, payload: { kind: "answer", sdp: answer } });
-      return;
+      await partnerPC.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await partnerPC.createAnswer();
+      await partnerPC.setLocalDescription(answer);
+      wsSend({ type: "relay", to: partnerId, payload: { kind: "answer", sdp: answer } });
+      log(`回覆 ${partnerId} Answer`);
     }
 
-    // 來自某 viewer 的 candidate
-    if (p.kind === "candidate" && p.from && viewerPCs[p.from]) {
-      try { await viewerPCs[p.from].addIceCandidate(p.candidate); } catch {}
-    }
-  }
-};
-</script>
+    ws.onmessage = async (ev) => {
+      const msg = JSON.parse(ev.data);
+
+      if (msg.type === "registered") {
+        log(`已註冊並等待配對…`);
+        return;
+      }
+
+      // 伺服器配對通知
+      if (msg.type === "startPair") {
+        partnerId = msg.partnerId;
+        log(`配對成功：${myId} <--> ${partnerId}`);
+
+        // 決定由誰主動發 Offer（避免雙邊同時發）
+        if (lexicographicallySmaller(myId, partnerId)) {
+          await startPartnerAsCaller();
+        } else {
+          log(`等待 ${partnerId} 的 Offer…`);
+        }
+        return;
+      }
+
+      // 中繼訊息（包含：offer/answer/candidate 與 viewerOffer）
+      if (msg.type === "relay" && msg.payload) {
+        const p = msg.payload;
+
+        // 來自 Partner 的信令
+        if (p.from === partnerId) {
+          if (p.kind === "offer") {
+            await startPartnerAsCallee(p.sdp);
+          }
+          if (p.kind === "answer" && partnerPC) {
+            await partnerPC.setRemoteDescription(new RTCSessionDescription(p.sdp));
+            log(`已接收 ${partnerId} Answer`);
+          }
+          if (p.kind === "candidate" && partnerPC && p.candidate) {
+            try { await partnerPC.addIceCandidate(p.candidate); } catch { }
+          }
+          return;
+        }
+
+        // 來自某個 Viewer 的觀看請求（viewerOffer）
+        if (p.kind === "viewerOffer") {
+          const viewerId = p.from;
+          // 與此 viewer 建立 sendonly
+          let vpc = viewerPCs[viewerId];
+          if (vpc) { vpc.close(); }
+          vpc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+          viewerPCs[viewerId] = vpc;
+
+          vpc.onicecandidate = (e) => {
+            if (e.candidate) {
+              wsSend({ type: "relay", to: viewerId, payload: { kind: "candidate", candidate: e.candidate } });
+            }
+          };
+
+          // 只傳送本機影像
+          localStream.getTracks().forEach(t => vpc.addTrack(t, localStream));
+
+          await vpc.setRemoteDescription(new RTCSessionDescription(p.sdp));
+          const answer = await vpc.createAnswer();
+          await vpc.setLocalDescription(answer);
+
+          wsSend({ type: "relay", to: viewerId, payload: { kind: "answer", sdp: answer } });
+          return;
+        }
+
+        // 來自某 viewer 的 candidate
+        if (p.kind === "candidate" && p.from && viewerPCs[p.from]) {
+          try { await viewerPCs[p.from].addIceCandidate(p.candidate); } catch { }
+        }
+      }
+    };
+  </script>
 </body>
+
 </html>
