@@ -1,0 +1,150 @@
+<!-- public/viewer.html
+  第9台查詢電腦使用：單向觀看任意一台 Peer 的視訊
+  - 自己不開攝影機
+  - 透過 recvonly offer 要求目標 Peer 回傳視訊
+-->
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <title>Viewer（查詢電腦）</title>
+  <link rel="stylesheet" href="client.css" />
+</head>
+<body>
+  <h1>Viewer（查詢電腦）<span class="badge">單向觀看</span></h1>
+
+  <div class="row">
+    <div class="card">
+      <label>Viewer ID</label>
+      <input id="viewerId" placeholder="例如 Viewer01" />
+      <button id="btnRegister" class="primary">註冊</button>
+
+      <label style="margin-top:8px;">選擇要觀看的 Peer</label>
+      <select id="targetSelect">
+        <option>A1</option><option>A2</option>
+        <option>B1</option><option>B2</option>
+        <option>C1</option><option>C2</option>
+        <option>D1</option><option>D2</option>
+      </select>
+      <button id="btnWatch">開始觀看</button>
+
+      <div class="status" id="status"></div>
+    </div>
+
+    <div class="card">
+      <h3>觀看畫面</h3>
+      <video id="remoteVideo" autoplay playsinline controls></video>
+    </div>
+  </div>
+
+  <script>
+    const ws = new WebSocket(`ws://${location.host}`);
+    const statusEl = document.getElementById("status");
+    const viewerIdEl = document.getElementById("viewerId");
+    const btnRegister = document.getElementById("btnRegister");
+    const targetSel = document.getElementById("targetSelect");
+    const btnWatch = document.getElementById("btnWatch");
+    const remoteVideo = document.getElementById("remoteVideo");
+
+    const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
+    let viewerId = null;
+    let targetId = null;
+
+    let pc = null;
+
+    function log(msg) {
+      console.log(msg);
+      statusEl.textContent = msg;
+    }
+
+    function wsSend(obj) {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+    }
+
+    function createPC() {
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+      // 我方為 recvonly，不加入本地 track
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate && targetId) {
+          wsSend({
+            type: "relay",
+            to: targetId,
+            payload: { kind: "viewerCandidate", candidate: ev.candidate }
+          });
+        }
+      };
+      pc.ontrack = (ev) => {
+        remoteVideo.srcObject = ev.streams[0];
+      };
+      return pc;
+    }
+
+    btnRegister.onclick = () => {
+      viewerId = viewerIdEl.value.trim() || "Viewer01";
+      wsSend({ type: "register", id: viewerId, role: "viewer" });
+    };
+
+    btnWatch.onclick = async () => {
+      if (!viewerId) return alert("請先註冊 Viewer ID");
+      targetId = targetSel.value;
+
+      // 告訴伺服器我要看誰（可選步驟）
+      wsSend({ type: "viewerSelect", viewerId, targetId });
+
+      // 建立 recvonly
+      if (pc) pc.close();
+      pc = createPC();
+      pc.addTransceiver("video", { direction: "recvonly" });
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      // 將 offer 轉給目標 peer
+      wsSend({
+        type: "relay",
+        to: targetId,
+        payload: { kind: "viewerOffer", sdp: offer }
+      });
+
+      log(`已向 ${targetId} 發出觀看請求`);
+    };
+
+    ws.onmessage = async (ev) => {
+      const msg = JSON.parse(ev.data);
+
+      if (msg.type === "registered") {
+        log(`Viewer 註冊成功：${msg.id}`);
+        return;
+      }
+
+      if (msg.type === "viewerTargetReady") {
+        log(`目標在線：${msg.targetId}，等待回應…`);
+        return;
+      }
+
+      if (msg.type === "error") {
+        log(`錯誤：${msg.message}`);
+        return;
+      }
+
+      if (msg.type === "relay" && msg.payload) {
+        const p = msg.payload;
+        // 來自目標 peer 的回應
+        if (p.kind === "viewerAnswer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(p.sdp));
+          log(`已連上 ${p.from}（單向觀看）`);
+        } else if (p.kind === "viewerCandidate" && p.candidate) {
+          try { await pc.addIceCandidate(p.candidate); } catch {}
+        }
+      }
+
+      if (msg.type === "forceDisconnect") {
+        log("被迫下線：" + (msg.reason || ""));
+        location.reload();
+      }
+    };
+  </script>
+</body>
+</html>
+
