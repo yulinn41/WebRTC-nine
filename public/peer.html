@@ -77,8 +77,26 @@ async function startPartnerAsCaller() {
 
   const offer = await partnerPC.createOffer();
   await partnerPC.setLocalDescription(offer);
-  wsSend({ type: "relay", to: partnerId, payload: { kind: "offer", sdp: offer } });
-  log(`向 ${partnerId} 發出 Offer`);
+
+  // ✅ 等待 ICE 全部收集完畢再送 Offer
+  await new Promise(resolve => {
+    if (partnerPC.iceGatheringState === "complete") {
+      resolve();
+    } else {
+      partnerPC.onicegatheringstatechange = () => {
+        if (partnerPC.iceGatheringState === "complete") {
+          resolve();
+        }
+      };
+    }
+  });
+
+  wsSend({
+    type: "relay",
+    to: partnerId,
+    payload: { kind: "offer", sdp: partnerPC.localDescription }
+  });
+  log(`向 ${partnerId} 發出 Offer（ICE Ready）`);
 }
 
 async function startPartnerAsCallee(offer) {
